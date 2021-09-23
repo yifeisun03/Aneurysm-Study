@@ -1,0 +1,127 @@
+---
+title: "Single cell Analysis Workflow"
+author: "Yifei Sun"
+date: "9/21/2021"
+output: html_document
+---
+
+```{r step1: loading library}
+library("Seurat")
+library("ggplot2")
+library("celldex")
+library(SingleR)
+library(pheatmap)
+library(devtools)
+###here's some baisc ones we need here, try to insatll and load, if some packages are hard to load, make sure at least have Seurat for now
+```
+
+```{r step2: data readin and filter}
+##locate the filtered_gene_bc_matrices folder which hold the 3 requied files, name(sample1 here) the object based on the experiment lable(WT, MSF, dXT, etc)
+Sample1<-Read10X(data.dir = "filtered_gene_bc_matrices/")
+
+##create object and filtering
+Sample1 <-CreateSeuratObject(count=Sample1,assay = "RNA",min.cells=3, min.feaures=200, project='Sample1')
+Sample1[["percent.mt"]] <- PercentageFeatureSet(Sample1, pattern = "^MT-")
+Sample1[["complexity"]] <- log10(Sample1$nFeature_RNA) / log10(Sample1$nCount_RNA)
+##plot out the raw data QC
+pdf("Sample1_QC.pdf") 
+VlnPlot(Sample1, features = c("nFeature_RNA", "nCount_RNA", "percent.mt","complexity"), pt.size = 0.2,ncol = 4)
+dev.off()
+
+##filter data
+##based on the initial QC plot, you can change the parameter for the following subset()
+Sample1_filter<- subset(Sample1, subset = nFeature_RNA > 200 & nFeature_RNA < 3000 &percent.mt < 10 & complexity> 0.80)
+Sample1_filter<-CalculateBarcodeInflections(Sample1_filter)
+SubsetByBarcodeInflections(Sample1_filter)
+#basic sample level normalization
+Sample1_filter <- NormalizeData(Sample1_filter, verbose = FALSE)
+Sample1_filter <- FindVariableFeatures(Sample1_filter, selection.method = "vst", nfeatures = 2000)
+Sample1_filter_var.features<-filter_N1054@assays$RNA@var.features
+Sample1_filter <- CellCycleScoring(object = Sample1_filter,g2m.features = cc.genes$g2m.genes, s.features = cc.genes$s.genes)
+##plot out the filter data QC
+pdf("Sample1_filter_QC.pdf") 
+VlnPlot(Sample1_filter, features = c("nFeature_RNA", "nCount_RNA", "percent.mt","complexity"), pt.size = 0.2,ncol = 4)
+dev.off()
+#I normaly saved the filtered rds file for each sample, in case I want to try different normalization, intergration in the future.
+saveRDS(Sample1_filter,file="Sample1_filter.rds")
+#######repeat this for other samples and name them differtly
+```
+
+```{r step3: intergration}
+##find the total variable gene for all samples
+var_total<-unique(c(Sample1_filter_var.features,Sample2_filter_var.features,Sample3_filter_var.features,Sample4_filter_var.features,Sample5_filter_var.features,))
+
+length(var_total)
+#3based on the number, you can adjust the anchor.features number in the next step
+##the next step may take some time, is recommended to save the anchor result in case R crash in the future
+integration.anchors <- FindIntegrationAnchors(object.list = list(Sample1_filter,Sample2_filter,Sample3_filter,Sample4_filter,Sample5_filter), dims = 1:30, anchor.features=5000)
+saveRDS(integration.anchors, file = "integration.anchors.rds")
+
+##find out how many genes are shared by the total variable genes and anchors
+var_total.anchor<-intersect(integration.anchors@anchor.features,var_total)
+length(var_total.anchor)
+
+##If this output is close enough to integration.anchors@anchor.features or var_total, then we can use the defualt
+all.combined <- IntegrateData(anchorset = integration.anchors)
+
+##if less then 40-50% of the gene are overlapping in the length(var_total.anchor), then we may need to use all the genes that matters to variation and anchoring for intergration, do the extra step as follow
+
+features.to.integrate =union(integration.anchors@anchor.features,var_total)
+all.combined <- IntegrateData(anchorset = integration.anchors, dims = 1:30,features.to.integrate =features.to.integrate)
+
+
+saveRDS(all.combined, file = "all.combined.rds")
+```
+
+```{r step4: dimension reduction and clustering}
+DefaultAssay(all.combined) <- "integrated"
+#Run the standard workflow for visualization and clustering
+all.combined <- ScaleData(all.combined, verbose = FALSE)
+##only run the follwing one if you see bad cell cycle clustering running through this section
+#all.combined <- ScaleData(all.combined, verbose = FALSE,vars.to.regress = c("S.Score", "G2M.Score"))
+
+all.combined <- RunPCA(all.combined, npcs = 30, verbose = FALSE)
+all.combined<- JackStraw(all.combined, num.replicate = 100)#takes time
+all.combined <- ScoreJackStraw(all.combined, dims = 1:20)
+ElbowPlot(all.combined)
+# choose PC  here afrom elbow plot
+
+
+all.combined <- RunUMAP(all.combined, reduction = "pca", dims = 1:20)#be sure to change the dims based on previous elbow plot
+all.combined <- FindNeighbors(all.combined, reduction = "pca", dims = 1:20)#be sure to change the dims based on previous elbow plot
+all.combined<- FindClusters(all.combined, resolution = c(0.4,0.8,1.2,1.6,1.8))
+
+
+###basic plotting to check what's the optimal resulotion, or is it needed for cell cycle correction
+Idents(object = all.combined) <- "integrated_snn_res.0.4"
+DimPlot(all.combined)###check at different resolution and its cluster number
+DimPlot(all.combined,group.by = "Phase",pt.size =0.01,label.size = 4) ##this should get you a figure of cell cycle 
+
+#if the cel cycle looks fine and umap loos fine, you can save the intergrated object for now
+saveRDS(all.combined, file = "all.combined_1.rds")
+```
+
+```{r step5: automatic annotaion and finding optimal resolution}
+#### part1:singleR cell type annotation, this secion require singleR install.
+hpca.se <- HumanPrimaryCellAtlasData()
+
+pred.cell.anno <- SingleR(test = all.combined@assays$RNA@counts, ref = hpca.se, assay.type.test=1,labels = hpca.se$label.main)
+saveRDS(pred.cell.anno,file="pred.cell.anno.rds")
+
+table(pred.cell.anno$labels)
+all.combined[["SingleR.labels"]]<-pred.cell.anno$labels
+###you can play around singleR lable with resolution to get some clue, find a relatively good point where 80-90% of each cluster only have 1 kind of cell annotation lable.
+table(all.combined$SingleR.labels, all.combined$integrated_snn_res.0.4)
+
+####part2 find marker and check the heatmap for over/under clustering(it is okay to have multiple clusters look similar, you can always renamed them afterward, but maybe not have a super high resolution where you have to rename 10-20 clusters to a single annotation)
+Idents(object = all.combined) <- "integrated_snn_res.0.4"
+
+
+all.combined_marker<- FindAllMarkers(all.combined, only.pos = TRUE,min.pct = 0.25)
+all.combined_marker_top10<-all.combined_marker %>% group_by(cluster) %>% top_n(n = 10, wt = avg_log2FC)
+
+pdf(file="all.combined_marker_top10_heatmap.pdf")
+DoHeatmap(all.combined,label=T, features = all.combined_marker_top10$gene,size=3)
+dev.off()
+```
+
