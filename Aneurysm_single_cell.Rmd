@@ -103,9 +103,10 @@ saveRDS(all.combined, file = "all.combined_1.rds")
 
 ```{r step5: automatic annotaion and finding optimal resolution}
 #### part1:singleR cell type annotation, this secion require singleR install.
-hpca.se <- HumanPrimaryCellAtlasData()
+hpca.se <- HumanPrimaryCellAtlasData()###use for human
+mouse.se <- MouseRNAseqData()###use for mouse
 
-pred.cell.anno <- SingleR(test = all.combined@assays$RNA@counts, ref = hpca.se, assay.type.test=1,labels = hpca.se$label.main)
+pred.cell.anno <- SingleR(test = all.combined@assays$RNA@counts, ref = mouse.se, assay.type.test=1,labels = hpca.se$label.main)
 saveRDS(pred.cell.anno,file="pred.cell.anno.rds")
 
 table(pred.cell.anno$labels)
