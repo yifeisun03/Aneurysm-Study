@@ -7,10 +7,23 @@ output: html_document
 
 ```{r 1. setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
+
+#https://2-bitbio.com/post/fuzzy-cmeans-clustering-of-rnaseq-data-using-mfuzz/
+#http://bioconductor.org/packages/devel/bioc/vignettes/DESeq2/inst/doc/DESeq2.html#variations-to-the-standard-workflow
 ```
 
 ```{r 2. loading packages}
 library(limma)
+library("marray")
+library(ReactomePA)
+library(clusterProfiler)
+library(ComplexHeatmap)
+library("org.Mm.eg.db")
+library(dplyr)
+library(RColorBrewer)
+library(tibble)
+library(ggplot2)
+library(Mfuzz)
 #library(Glimma)
 library(edgeR)
 library("vsn")
@@ -24,12 +37,13 @@ setwd("~/Documents/work/Aneurysm-Study")
 
 ```{r 3. loading raw counts}
 Feature_count=read.table("Feature_counts_data_matrix.txt",header = T,sep = "\t",stringsAsFactors = F)
+Feature_count<-Feature_count[,c(1,2,3,5,4,6,7)]
 names(Feature_count)
-names(Feature_count)<-c("mgR.1","mgR.2","mgR.C21","mgR.C21.LOS","mgR.LOS","WT.1","WT.2")
+names(Feature_count)<-c("mgR.1","mgR.2","mgR.C21","mgR.LOS","mgR.C21.LOS","WT.1","WT.2")
 
-samples<-data.frame(run=names(Feature_count),species="mouse")
-rownames(samples)<-samples$run
-samples$condition<-c("mgR","mgR","mgR.C21","mgR.C21.LOS","mgR.LOS","WT","WT")
+meta<-data.frame(run=names(Feature_count),species="mouse")
+rownames(meta)<-meta$run
+meta$condition<-c("mgR","mgR","mgR.C21","mgR.LOS","mgR.C21.LOS","WT","WT")
 
 lib.size <- estimateSizeFactorsForMatrix(Feature_count)
 ed <- t(t(Feature_count)/lib.size)
@@ -156,18 +170,22 @@ length(intersect(gene_w,gene_s))
 
 ```{r 5. selecting highly variabe genes from Deseq2}
 dds <- DESeqDataSetFromMatrix(countData = Feature_count,
-                              colData = samples,
+                              colData = meta,
                               design = ~ condition)
 dds$condition <- relevel(dds$condition, ref = "mgR")
+
 
 #Pre-filtering
 keep <- rowSums(counts(dds)) >= 10
 dds <- dds[keep,]
 dds <- DESeq(dds)
-res <- results(dds)
-#
-plotMA(res, ylim=c(-2,2))
-plotCounts(dds, gene=which.min(res$padj), intgroup="condition")
+#Generate the  normalized counts
+colSums(counts(dds))
+dds <- estimateSizeFactors(dds)
+sizeFactors(dds)
+normalized_counts <- counts(dds, normalized=TRUE)
+colSums(counts(dds, normalized=T))
+
 #
 vsd <- vst(dds, blind=FALSE)
 rld <- rlog(dds, blind=FALSE)
@@ -176,7 +194,8 @@ ntd <- normTransform(dds)
 # meanSdPlot(assay(vsd))
 # meanSdPlot(assay(rld))
 
-#sample-to-sample distances
+#sample-to-sample distances(vsd or rld)####
+#vsd method####
 sampleDists <- dist(t(assay(vsd)))
 sampleDistMatrix <- as.matrix(sampleDists)
 colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
@@ -186,6 +205,20 @@ pheatmap(sampleDistMatrix,
          col=colors)
 plotPCA(vsd, intgroup=c("condition"))
 
+#rld method####
+rld_mat <- assay(rld)
+pca <- prcomp(t(rld_mat))
+# Create data frame with metadata and PC3 and PC4 values for input to ggplot
+df <- cbind(meta, pca$x)
+ggplot(df) + geom_point(aes(x=PC3, y=PC4, color = condition))
+#Hierarchical Clustering
+### Extract the rlog matrix from the object
+rld_mat <- assay(rld)    ## assay() is function from the "SummarizedExperiment" package that was loaded when you loaded DESeq2
+### Compute pairwise correlation values
+rld_cor <- cor(rld_mat)    ## cor() is a base R function
+head(rld_cor)   ## check the output of cor(), make note of the rownames and colnames
+### Plot heatmap
+pheatmap(rld_cor)
 
 #heatmap of selected genes
 # These are the genes most variable across all samples regardless of which samples they are.
@@ -198,17 +231,208 @@ pheatmap(tmp,
          cluster_rows=TRUE, show_rownames=F,
          cluster_cols=TRUE,scale = "row")
 dev.off()
+```
+
+```{r 6. Mfuzz showing different treatment group trend}
+#Replicated arrays in the exprs matrix are treated as independent by the mfuzz function 
+#i.e. they should be averaged prior to clustering or placed into different distinct ExpressionSet objects.
+
+##step1: average biological replicate
+
+#normalized_counts from deseq2 result: normalized_counts <- counts(dds, normalized=TRUE)
+#ave.A <- rowMeans( counts(dds, normalized=TRUE)[ , dds$condition == "A" ] )
+normalized_counts<-as.data.frame(normalized_counts)
+normalized_counts <- normalized_counts %>%
+        add_column(mgR = (normalized_counts$mgR.1+normalized_counts$mgR.2)/2,
+                   .after = "mgR.2") 
+normalized_counts <- normalized_counts %>%
+        add_column(WT = (normalized_counts$WT.1+normalized_counts$WT.2)/2,
+                   .after = "WT.2") 
+pheatmap(cor(normalized_counts))#check if the averaged group highly correlated with both replicates
+normalized_counts<-normalized_counts[,-c(1,2,7,8)]
+
+##step2: mfuzz pre-processing
+normalized_counts <- data.matrix(normalized_counts)
+eset <- new("ExpressionSet",exprs = normalized_counts)
+# remove low sd genes
+eset <- filter.std(eset,min.std=0)
+#standardise，
+eset <- standardise(eset)
+#3.clustering, Mfuzz need 2 arguments，c(the cluster we are aiming for,arbitury)，fuzzifier(m: evaluated by mestimate)
+m <- mestimate(eset)
+Dmin(eset, m=m, crange=seq(2,22,1), repeats=3, visu=TRUE) #slow help you find out the max cluster number
+
+c <- 10# thins number should be adjusted after reviewing plots
+
+set.seed(1030)
+cl <- mfuzz(eset, c = c, m = m)
+
+#4 visualization
+#color.2 <- colorRampPalette(rev(c("#ff0000", "Yellow", "OliveDrab1")))(1000)
+pdf("mfuzz_s5_clustreing_c10.pdf")
+mfuzz.plot(eset,cl,mfrow=c(3,4),new.window= FALSE,time.labels=colnames(normalized_counts))
+dev.off()
+
+##alternative visualization
+mfuzz.plot2(eset,cl=cl,mfrow=c(3,4),colo="fancy",time.labels=colnames(normalized_counts),
+ax.col="red",bg = "white",col.axis="red",col.lab="black",
+col.main="black",col.sub="blue",col="blue",cex.main=0.5,cex.lab=1.1)
+
+
+##5. validation
+#One thing worth including in any cluster analysis is a post hoc test of the correlation between cluster centroids.
+#If you over clustered, and ended up with redundant clusters, you can detect this by correlating the centers to see if they are too similar.
+#Ideally, no two clusters should exhibit a correlation greater than 0.85
+cor(t(cl[[1]])) ##pheatmap(cor(t(cl[[1]])))
+#extracts membership values 
+acore <- acore(eset,cl,min.acore=0)
+acore_list <- do.call(rbind, lapply(seq_along(acore), function(i){ data.frame(CLUSTER=i, acore[[i]])}))
+
+#6 expore cl object
+# gene number in each cluster
+cl$size
+# getting the genes in each cluster
+c1_gene<-names(cl$cluster[cl$cluster == 1])
+# checking the membership of gene and each cluster
+cl$membership
+
+
+### Single cluster  with colorbar (cluster # 3) 
+X11(width=12)
+mat <- matrix(1:2,ncol=2,nrow=1,byrow=TRUE)
+l   <- layout(mat,width=c(5,1))
+ 
+mfuzz.plot2(eset,cl=cl,mfrow=NA,colo="fancy", ax.col="red",bg = "black",col.axis="red",col.lab="white",
+ col.main="green",col.sub="blue",col="blue",cex.main=2, single=1,x11=FALSE)
+
+mfuzzColorBar(main="Membership",cex.main=1)
+```
+
+```{r 7. Mfuzz cluster1 genes heatmap(DEseq rld slot)}
+#heatmap of selected genes
+tmp<-rld@assays@data@listData[[1]]
+tmp<-tmp[c1_gene,]
+pdf("test.pdf")
+out <-pheatmap(tmp, 
+         cluster_rows=TRUE, show_rownames=F,
+         cluster_cols=FALSE,scale = "row")
+out
+dev.off()
+
+#Re-order original data (genes) to match ordering in heatmap (top-to-bottom)
+rownames(tmp[out$tree_row[["order"]],])
+#If you want something like gene-to-cluster assignment, you can 'cut' your row dendrogram into a pre-selected number of groups as follows:
+#2 groups
+sort(cutree(out$tree_row, k=2))
+#You can also cut the tree at a pre-defined tree height, and extract the gene-to-cluster assignments at that height:
+plot(out$tree_row)
+abline(h=4.7, col="red", lty=2, lwd=2)
+sort(cutree(out$tree_row, h=4.7))
+
+C1_gene_df<-as.data.frame(sort(cutree(out$tree_row, h=4.7)))
+table(C1_gene_df)
+C1_gene_conserve<-rownames(subset(C1_gene_df,sort(cutree(out$tree_row, h = 4.7))==1))
+
+pheatmap(tmp[C1_gene_conserve,], 
+         cluster_rows=TRUE, show_rownames=F,
+         cluster_cols=FALSE,scale = "row")
+
+```
+
+```{r 8. functional annotation}
+df <- bitr(C1_gene_conserve,
+           fromType = "ENSEMBL",
+           toType = c("SYMBOL","ENTREZID"),
+           OrgDb = org.Mm.eg.db)
+
+#
+kk <- enrichKEGG(gene = df$ENTREZID,organism = 'mmu',
+                 pvalueCutoff = 0.7,qvalueCutoff=0.7)
+dotplot(kk, showCategory=20,font=7) +
+        ggtitle("KEGG pathway over-representation analysis for cluster1 genes")+
+        theme(plot.title = element_text(size = 10, face = "bold"))
+
+#
+ReaP <- enrichPathway(gene = df$ENTREZID, organism="mouse",
+                      pvalueCutoff = 0.7,qvalueCutoff=0.7, readable=TRUE)
+dotplot(ReaP, showCategory=20,font=7) +
+         ggtitle("Pathway enrichment analysis for cluster1")+
+        theme(plot.title = element_text(size = 10, face = "bold"))
+
+#
+go_enrich_results <- lapply( c('BP','MF','CC') , function(ont) {
+  cat(paste('Now process ',ont ))
+  ego <- enrichGO(gene          = df$ENTREZID,
+                  OrgDb         = org.Mm.eg.db,
+                  ont           = ont ,
+                  pAdjustMethod = "BH",
+                  pvalueCutoff  = 0.9,
+                  qvalueCutoff  = 0.9,
+                  readable      = TRUE)
+
+  print( head(ego) )
+  dotplot(ego,title=paste0('dotplot_',ont)) %>% print()
+  return(ego)
+})
+
+write.csv(df,file="cluster1_gene_conserved.csv")
+
+```
+
+```{r orgnizing cluster specific gene expression file}
+#
+mfuzz_genelist<-list()
+out_heatmap<-list()
+for(i in c(1,4,6)){
+        print(i) 
+        id<-paste("Cluster",i)      
+        mfuzz_genelist[[id]]<-names(cl$cluster[cl$cluster == i])    
+        tmp<-rld@assays@data@listData[[1]]
+        tmp<-tmp[mfuzz_genelist[[id]],]
+        pdf(paste("heatmap_all_cluster",i,".pdf"))
+        out_heatmap[[id]] <-pheatmap(tmp, 
+                                     cluster_rows=TRUE, show_rownames=F,
+                                     cluster_cols=FALSE,scale = "row")
+        out_heatmap[[id]]
+        dev.off() 
+        
+}
+mfuzz_genelist$`Cluster 1`<-C1_gene_conserve
+#
+mfuzz_genelist_annodf<-list()
+for(i in names(mfuzz_genelist)){
+        print(i)
+           
+           mfuzz_genelist_annodf[[i]]<- bitr(mfuzz_genelist[[i]],
+           fromType = "ENSEMBL",
+           toType = c("SYMBOL","ENTREZID"),
+           OrgDb = org.Mm.eg.db)
+           
+           print(length(mfuzz_genelist_annodf[[i]]$ENSEMBL))
+           print(length(unique(mfuzz_genelist_annodf[[i]]$ENSEMBL)))
+          #rownames(mfuzz_genelist_df[[i]]) <-mfuzz_genelist_df[[i]]$ENSEMBL
+}
+#
+mfuzz_genelist_norm_expr<-list()
+for(i in names(mfuzz_genelist)){
+        print(i)        
+        normalized_counts <- counts(dds, normalized=TRUE)
+        mfuzz_genelist_norm_expr[[i]]<- normalized_counts [mfuzz_genelist[[i]],]     
+        mfuzz_genelist_norm_expr[[i]]<-as.data.frame(mfuzz_genelist_norm_expr[[i]])
+        mfuzz_genelist_norm_expr[[i]]$ENSEMBL<-rownames(mfuzz_genelist_norm_expr[[i]])
+        mfuzz_genelist_norm_expr[[i]] <- merge(mfuzz_genelist_norm_expr[[i]],mfuzz_genelist_annodf[[i]],by="ENSEMBL")
+        mfuzz_genelist_norm_expr[[i]]<-data.frame(lapply(mfuzz_genelist_norm_expr[[i]], function(y) if(is.numeric(y)) round(y, 2) else y))
+        file.name=paste("Cluster",i,"Normalized gene count.csv")
+        write.csv(mfuzz_genelist_norm_expr[[i]],file=file.name)
+}
+  pheatmap(mfuzz_genelist_norm_exp$`Cluster 6` [,2:8],
+  cluster_rows=TRUE, show_rownames=F,
+  cluster_cols=FALSE,scale = "row")
 
 
 
 
 
 
-
-
-
-
-
-http://bioconductor.org/packages/devel/bioc/vignettes/DESeq2/inst/doc/DESeq2.html#variations-to-the-standard-workflow
 ```
 
