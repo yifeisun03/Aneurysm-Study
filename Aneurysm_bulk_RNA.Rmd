@@ -1,0 +1,214 @@
+---
+title: "Aneurysm_bulk_RNA"
+author: "YS"
+date: "9/29/2021"
+output: html_document
+---
+
+```{r 1. setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r 2. loading packages}
+library(limma)
+#library(Glimma)
+library(edgeR)
+library("vsn")
+#library(Mus.musculus)
+library(DESeq2)
+library("pheatmap")
+library("RColorBrewer")
+require(statmod)
+setwd("~/Documents/work/Aneurysm-Study")
+```
+
+```{r 3. loading raw counts}
+Feature_count=read.table("Feature_counts_data_matrix.txt",header = T,sep = "\t",stringsAsFactors = F)
+names(Feature_count)
+names(Feature_count)<-c("mgR.1","mgR.2","mgR.C21","mgR.C21.LOS","mgR.LOS","WT.1","WT.2")
+
+samples<-data.frame(run=names(Feature_count),species="mouse")
+rownames(samples)<-samples$run
+samples$condition<-c("mgR","mgR","mgR.C21","mgR.C21.LOS","mgR.LOS","WT","WT")
+
+lib.size <- estimateSizeFactorsForMatrix(Feature_count)
+ed <- t(t(Feature_count)/lib.size)
+```
+
+```{r 4. selecting highly variable genes from raw counts} 
+###calculate library size then normalize(if not done yet)
+# lib.size <- estimateSizeFactorsForMatrix(Feature_count)
+# ed <- t(t(Feature_count)/lib.size)
+###METHOD 1####
+#Calculate estimates of variance, coefficient of variation
+means <- rowMeans(ed)
+vars <- apply(ed,1,var)
+cv2 <- vars/means^2
+#Now fit a regression line based on the controls:
+minMeanForFit <- unname( quantile( means[ which( cv2 > .3 ) ], .95 ) )
+useForFit <- means >= minMeanForFit # & spikeins
+fit <- glmgam.fit( cbind( a0 = 1, a1tilde = 1/means[useForFit] ),cv2[useForFit] )
+a0 <- unname( fit$coefficients["a0"] )
+a1 <- unname( fit$coefficients["a1tilde"])
+fit$coefficients
+#Now add the fit and the 95% confidence interval to our plot:
+xg <- exp(seq( min(log(means[means>0])), max(log(means)), length.out=1000 ))
+vfit <- a1/xg + a0
+df <- ncol(ed) - 1
+#Rank genes by the significance of deviation from the fit
+afit <- a1/means+a0
+varFitRatio <- vars/(afit*means^2)
+varorder <- order(varFitRatio,decreasing=T)
+oed <- ed[varorder,]
+
+# save for the next exercise
+save(oed,file="oed_standard.RData")
+#plotting
+pdf("test.pdf")
+par(mar=c(3.5,3.5,1,1),mgp=c(2,0.65,0),cex=0.9); smoothScatter(log(means),log(cv2)); lines( log(xg), log(vfit), col="black", lwd=3 ); lines(log(xg),log(vfit * qchisq(0.975,df)/df),lty=2,col="black"); lines(log(xg),log(vfit * qchisq(0.025,df)/df),lty=2,col="black");
+# add top 500 genes
+points(log(means[varorder[1:500]]),log(cv2[varorder[1:500]]),col=2)
+dev.off()
+#highly variable genes
+# means[varorder[1:500]]
+
+#evaluate statistical significance of the deviation
+pval <- pchisq(varFitRatio*df,df=df,lower.tail=F)
+adj.pval <- p.adjust(pval,"fdr")
+sigVariedGenes <- adj.pval<1e-3;
+table(sigVariedGenes)
+
+#Look at how the most variable genes are expressed …
+pdf("test.pdf")
+m <- oed[1:500,]
+heatmap(m/apply(m,1,max),zlim=c(0,1),cluster_rows=T,cluster_cols=T,scale="none")
+dev.off()
+
+###METHOD 2   winsorize#####
+winsorize <- function (x, fraction=0.05) {
+        if(length(fraction) != 1 || fraction < 0 ||
+           fraction > 0.5) {
+                stop("bad value for 'fraction'")
+        }
+        lim <- quantile(x, probs=c(fraction, 1-fraction))
+        x[ x < lim[1] ] <- lim[1]
+        x[ x > lim[2] ] <- lim[2]
+        x
+}
+
+# winsorize to remove 2 most extreme cells (from each side)
+wed <- t(apply(ed, 1, winsorize, fraction=2/ncol(ed)))
+
+# now let's recalculate the most variable genes with the winsorized matrix (wed)
+means = rowMeans(wed); vars = apply(wed,1,var); cv2 <- vars/means^2
+xg <- exp(seq( min(log(means[means>0])), max(log(means)), length.out=1000 ))
+useForFit <- means >= unname( quantile( means[ which( cv2 > .3 ) ], .95 ) ) 
+fit <- glmgam.fit( cbind( a0 = 1, a1tilde = 1/means[useForFit] ),cv2[useForFit] )
+afit <- fit$coef["a1tilde"]/means+fit$coef["a0"]
+vfit <- fit$coef["a1tilde"]/xg+fit$coef["a0"]
+varFitRatio <- vars/(afit*means^2)
+varorder <- order(varFitRatio,decreasing=T)
+oed <- wed[varorder,]
+# save for the next exercise
+save(oed,file="oed_winsorize.RData")
+
+#plotting
+df <- ncol(ed) - 1
+
+pdf("test.pdf")
+par(mar=c(3.5,3.5,1,1),mgp=c(2,0.65,0),cex=0.9); smoothScatter(log(means),log(cv2)); lines( log(xg), log(vfit), col="black", lwd=3 ); lines(log(xg),log(vfit * qchisq(0.975,df)/df),lty=2,col="black"); lines(log(xg),log(vfit * qchisq(0.025,df)/df),lty=2,col="black");
+# add top 500 genes
+points(log(means[varorder[1:500]]),log(cv2[varorder[1:500]]),col=2)
+dev.off()
+
+#heatmap of top genes
+pdf("test.pdf")
+m <- oed[1:500,]
+heatmap(m/apply(m,1,max),zlim=c(0,1),cluster_rows=T,cluster_cols=T,scale="none",show_rownames=FALSE)
+dev.off()
+
+
+###METHOD 3 PCA getting top genes####
+#(not good)
+cols=c("mgR.1"="red","mgR.2"="red","WT.1"="blue","WT.2"="blue","mgR.C21"="yellow","mgR.C21.LOS"="green","mgR.LOS"="purple")
+require(pcaMethods)
+pcs <- pca(oed,nPcs=5)
+plot(loadings(pcs)[,1],loadings(pcs)[,2],xlab="PC1",ylab="PC2",col=cols)
+#We can get similarly good separation with just the top 100 most variable genes
+pcs <- pca(oed[1:2500,],nPcs=5)
+plot(loadings(pcs)[,1],loadings(pcs)[,2],xlab="PC1",ylab="PC2",col=cols)
+
+###comparison between the highly variable genes between 2 method####
+load("~/Documents/work/Aneurysm-Study/oed_winsorize.RData")
+oed_winsorize<-oed
+load("~/Documents/work/Aneurysm-Study/oed_standard.RData")
+oed_standard<-oed
+
+gene_w<-rownames(oed_winsorize[1:3500,])
+gene_s<-rownames(oed_standard[1:3500,])
+
+length(intersect(gene_w,gene_s))
+#341 out of 500+500 (0.682)
+#1941 out of 2500+2500 (0.7764)
+#2712 out of 3500+3500 3500(0.77)
+#http://pklab.med.harvard.edu/scw2014/subpop_tutorial.html
+```
+
+```{r 5. selecting highly variabe genes from Deseq2}
+dds <- DESeqDataSetFromMatrix(countData = Feature_count,
+                              colData = samples,
+                              design = ~ condition)
+dds$condition <- relevel(dds$condition, ref = "mgR")
+
+#Pre-filtering
+keep <- rowSums(counts(dds)) >= 10
+dds <- dds[keep,]
+dds <- DESeq(dds)
+res <- results(dds)
+#
+plotMA(res, ylim=c(-2,2))
+plotCounts(dds, gene=which.min(res$padj), intgroup="condition")
+#
+vsd <- vst(dds, blind=FALSE)
+rld <- rlog(dds, blind=FALSE)
+ntd <- normTransform(dds)
+# meanSdPlot(assay(ntd))
+# meanSdPlot(assay(vsd))
+# meanSdPlot(assay(rld))
+
+#sample-to-sample distances
+sampleDists <- dist(t(assay(vsd)))
+sampleDistMatrix <- as.matrix(sampleDists)
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows=sampleDists,
+         clustering_distance_cols=sampleDists,
+         col=colors)
+plotPCA(vsd, intgroup=c("condition"))
+
+
+#heatmap of selected genes
+# These are the genes most variable across all samples regardless of which samples they are.
+topVarGenes <- order(rowVars(assay(rld)),decreasing=TRUE)
+tmp<-rld@assays@data@listData[[1]]
+tmp<-tmp[topVarGenes[1:5000],]
+
+pdf("test.pdf")
+pheatmap(tmp, 
+         cluster_rows=TRUE, show_rownames=F,
+         cluster_cols=TRUE,scale = "row")
+dev.off()
+
+
+
+
+
+
+
+
+
+
+
+http://bioconductor.org/packages/devel/bioc/vignettes/DESeq2/inst/doc/DESeq2.html#variations-to-the-standard-workflow
+```
+
